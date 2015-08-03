@@ -21,7 +21,7 @@ def read_tag six_bytes
 
 end
 
-def find_binary in_file
+def find_blob in_file
 
 	# Calculate length of SWF file
 	length = in_file[4..7].unpack("V").join.to_i
@@ -94,7 +94,7 @@ end
 #  it could change between versions. As we know the plaintext, we can work
 #  out the key with relative ease.
 
-secret = find_binary in_file
+secret = find_blob in_file
 key = secret[1].ord ^ "W".ord
 
 puts "\r[+] Found first embedded SWF"
@@ -114,7 +114,7 @@ case secret[2]
 
 end
 
-payload = find_binary secret
+payload = find_blob secret
 puts "\r[+] Found our target SWF!"
 
 
