@@ -1,0 +1,142 @@
+#!/usr/bin/env ruby
+require "base64"
+require "zlib"
+
+def read_tag six_bytes
+
+	# The first TWO bytes of a tag definition are a little-endian 16-bit uint
+	# These bytes AREN'T a bitfield, but the 10:6 ratio of bits signifies tag/length
+
+	# Let's unpack the next four bytes too, they could be useful later.
+	p = six_bytes.unpack("S<L<")
+
+	# Extract the first 10 bits (tag ID) and the remaining six (length)
+	tag = p[0] >> 6
+	length = p[0] & 0x3f
+
+	# 6 bits can store a number no greater than 63. So if the length overflows,
+	#  ignore it and use the next four bytes (a little-endian uint32).
+	length = p[1] if length == 63
+	return [tag, length, length > 63]
+
+end
+
+def find_binary in_file
+
+	# Calculate length of SWF file
+	length = in_file[4..7].unpack("V").join.to_i
+
+	# Skip the first 12 bytes, and the variable length field
+	seek = 12 + ((5.to_f + 4 * (in_file.unpack("C" * 10)[8] >> 3)) / 8).ceil
+
+	while seek < length
+		# If you're not sure what this does, all hope is lost.
+		tag = read_tag in_file[seek..seek+5]
+
+		if tag[0] != 87
+			# Skip over anything that's not a blob
+			seek += tag[1] + (tag[2] ? 6 : 2)
+			next
+		end
+
+		start_addr = seek + (tag[2] ? 12 : 8)
+		end_addr = seek + tag[1] + (tag[2] ? 5 : 1)
+		seek = end_addr + 1
+
+		return Zlib.inflate(in_file[start_addr..end_addr])
+	end
+
+	abort "\r[-] Couldn't find binary payload inside SWF - are you sure it is encrypted?"
+
+end
+
+abort "Usage: #{$0} file.swf <file.dec.swf>\n\n" unless ARGV.length.between? 1, 2
+
+start = Time.now.to_f
+in_file = File.read(ARGV[0], :encoding => "ASCII-8BIT")
+out_file = ARGV[1] || ARGV[0].gsub(".swf", ".dec.swf")
+
+Thread.new {
+	i = 0; chars = %w(\\ | / -)
+
+	loop do
+
+		# Quick, look busy! Let's print an animated cursor.
+		print "\r[#{chars[(i += 1) % chars.length]}]"
+		sleep 0.1
+
+	end
+}
+
+case in_file[0..2]
+	when "CWS"
+
+		# Use the encoded SWF length, in case of trailing data
+		# Software could add extra/trailing bytes to trick bad decompilers
+		body = in_file[8..in_file[4..7].unpack("V").join.to_i]
+		in_file = in_file[0..7] + Zlib::Inflate.inflate(body)
+		puts "\r[+] Decompressing SWF"
+
+	when "FWS"
+		puts "\r[+] SWF is already decompressed - interesting. Continuing"
+
+	else
+		abort "\r[-] The input file doesn't appear to be a SWF!"
+
+end
+
+# NOTE
+#  The first byte seems to be (purposefully?) corrupted, but SWF is compressed.
+#  Flash Player ignores the corrupted bytes in Loader.loadBytes. Maybe this is
+#   done on purpose to off-put decompilers?
+
+# First embedded SWF is XOR'd against a single char. This is usually 16, but
+#  it could change between versions. As we know the plaintext, we can work
+#  out the key with relative ease.
+
+secret = find_binary in_file
+key = secret[1].ord ^ "W".ord
+
+puts "\r[+] Found first embedded SWF"
+puts "\r[+] Extracted XOR key: #{key}"
+
+secret = secret.bytes.map { | b | (b ^ key).chr }.join
+
+# secret[1] will *always* be W, because of how we calculated the key. If
+#  we're lucky, the third character will be "S". 
+case secret[2]
+	when "S"
+		body = secret[8..secret[4..7].unpack("V").join.to_i]
+		secret = secret[0..7] + Zlib.inflate(body)
+
+	else
+		abort "\r[-] Failed to decrypt SWF. Is it really encrypted with SWFLock?"
+
+end
+
+payload = find_binary secret
+puts "\r[+] Found our target SWF!"
+
+
+# XOR key is the last 16 bytes of the payload....  C'mon SWFLock
+#  developers, I honestly expected something a bit more exciting!
+key = payload[-16..-1]; i = -1
+
+payload = Base64.decode64(payload[0..-17]).bytes.map { | b |
+
+	# XOR with a wrapped verison of the key. This would make a
+	#  good (but very messy) one-liner.
+	b ^= key[(i += 1) % key.length].ord
+	b.chr
+
+}.join
+
+
+abort "\r[-] Discovered payload doesn't look like a SWF file?!" unless payload[0..2].match /[CF]WS/
+
+# If you've made it this far without losing hope, you
+#  can probably guess what's this line of code does.
+File.write(out_file, payload)
+
+puts "\r[+] Written decrypted file to '#{out_file}`"
+puts "\r[!] Completed in #{(Time.now.to_f - start).round 3} seconds"
